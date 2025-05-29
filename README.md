@@ -7,7 +7,7 @@ It does not require the pieces to be overlapped.
 
 Examples of the assembly process:
 
-<img src="images\Eda_299_.gif" height="256"/> <img src="images\Eda_200_.gif" height="256"/> <img src="images\Eda_332_.gif" height="256"/> <img src="images\Eda_345_.gif" height="256"/> <img src="images\Eda_16_.gif" height="256"/><img src="images\Eda_89_.gif" height="256"/><img src="images\Eda_216_.gif" height="256"/>
+<img src="images\Eda_299_.gif" height="256"/> <img src="images\Eda_200_.gif" height="256"/> <img src="images\Eda_332_.gif" height="256"/> <img src="images\Eda_345_.gif" height="256"/> <img src="images\Eda_16_.gif" height="256"/><img src="images\Eda_89_.gif" height="196"/>
 
 ## Code
 Coming soon!
