@@ -1,0 +1,668 @@
+import logging
+import pdb
+from typing import Callable, Dict, Optional, Tuple
+
+import einops
+import numpy as np
+import torch
+from Dataset.functional import random_sample_rotation
+from model.FastSo3 import so3
+
+
+logger = logging.getLogger(__name__)
+
+
+
+def skew_matrix_to_vector(skew_matrices: torch.Tensor, eps: float=1e-3) -> torch.Tensor:
+    """
+    Extract a rotation vector from the so(3) skew matrix basis.
+
+    Args:
+        skew_matrices (torch.Tensor): Skew matrices. (B 3 3)
+
+    Returns:
+        torch.Tensor: Rotation vectors corresponding to skew matrices. (B, 3)
+    """
+    assert (skew_matrices + skew_matrices.mT).norm() / skew_matrices.shape[0] < eps, "The input matrix is not skew"
+    vector = torch.stack([skew_matrices[..., 2, 1], skew_matrices[..., 0, 2], skew_matrices[..., 1, 0]], -1)
+    return vector
+
+
+def vector_to_skew_matrix(vectors: torch.Tensor) -> torch.Tensor:
+    """
+    Map a vector into the corresponding skew matrix so(3) basis.
+    ```
+                [  0 -z  y]
+    [x,y,z] ->  [  z  0 -x]
+                [ -y  x  0]
+    ```
+
+    Args:
+        vectors (torch.Tensor): Batch of vectors to be mapped to skew matrices.
+
+    Returns:
+        torch.Tensor: Vectors in skew matrix representation.
+    """
+    zeros = torch.zeros(*vectors.shape[:-1], device=vectors.device, dtype=vectors.dtype, requires_grad=False).unsqueeze(-1)
+    skew_matrices = einops.rearrange(torch.cat([zeros, -vectors[..., 2, None], vectors[..., 1, None],
+                                                 vectors[..., 2, None], zeros, -vectors[..., 0, None],
+                                                 -vectors[..., 1, None], vectors[..., 0, None], zeros], -1),
+                                      '... (i j) -> ... i j', j=3)
+    return skew_matrices
+
+
+
+def _broadcast_identity(target: torch.Tensor) -> torch.Tensor:
+    """
+    Generate a 3 by 3 identity matrix and broadcast it to a batch of target matrices.
+
+    Args:
+        target (torch.Tensor): Batch of target 3 by 3 matrices.
+
+    Returns:
+        torch.Tensor: 3 by 3 identity matrices in the shapes of the target.
+    """
+    id3 = torch.eye(3, device=target.device, dtype=target.dtype)
+    id3 = torch.broadcast_to(id3, target.shape)
+    return id3
+
+
+
+
+def skew_matrix_exponential_map(
+    angles: torch.Tensor, skew_matrices: torch.Tensor, tol=1e-7
+) -> torch.Tensor:
+    """
+    Compute the matrix exponential of a rotation vector in skew matrix representation. Maps the
+    rotation from the lie group to the rotation matrix representation. Uses the following form of
+    Rodrigues' formula instead of `torch.linalg.matrix_exp` for better computational performance
+    (in this case the skew matrix already contains the angle factor):
+
+    .. math ::
+
+        \exp(\mathbf{K}) = \mathbf{I} + \frac{\sin(\theta)}{\theta} \mathbf{K} + \frac{1-\cos(\theta)}{\theta^2} \mathbf{K}^2
+
+    This form has the advantage, that Taylor expansions can be used for small angles (instead of
+    having to compute the unit length axis by dividing the rotation vector by small angles):
+
+    .. math ::
+
+        \frac{\sin(\theta)}{\theta} \approx 1 - \frac{\theta^2}{6}
+        \frac{1-\cos(\theta)}{\theta^2} \approx \frac{1}{2} - \frac{\theta^2}{24}
+
+    Args:
+        angles (torch.Tensor): Batch of rotation angles.
+        skew_matrices (torch.Tensor): Batch of rotation axes in skew matrix (lie so(3)) basis.
+
+    Returns:
+        torch.Tensor: Batch of corresponding rotation matrices.
+    """
+    # Set up identity matrix and broadcast.
+    id3 = _broadcast_identity(skew_matrices)
+
+    # Broadcast angles and pre-compute square.
+    angles = angles[..., None, None]
+    angles_sq = angles.square()
+
+    # Get standard terms.
+    sin_coeff = torch.sin(angles) / angles
+    cos_coeff = (1.0 - torch.cos(angles)) / angles_sq
+    # Use second order Taylor expansion for values close to zero.
+    sin_coeff_small = 1.0 - angles_sq / 6.0
+    cos_coeff_small = 0.5 - angles_sq / 24.0
+
+    mask_zero = torch.abs(angles) < tol
+    sin_coeff = torch.where(mask_zero, sin_coeff_small, sin_coeff)
+    cos_coeff = torch.where(mask_zero, cos_coeff_small, cos_coeff)
+
+    # Compute matrix exponential using Rodrigues' formula.
+    exp_skew = (
+        id3
+        + sin_coeff * skew_matrices
+        + cos_coeff * torch.einsum("b...ik,b...kj->b...ij", skew_matrices, skew_matrices)
+    )
+    return exp_skew
+
+
+
+
+
+
+
+
+def angle_from_rotmat(
+    rotation_matrices: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute rotation angles (as well as their sines and cosines) encoded by rotation matrices.
+    Uses atan2 for better numerical stability for small angles.
+
+    Args:
+        rotation_matrices (torch.Tensor): Batch of rotation matrices.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Batch of computed angles, sines of the
+          angles and cosines of angles.
+    """
+    # Compute sine of angles (uses the relation that the unnormalized skew vector generated by a
+    # rotation matrix has the length 2*sin(theta))
+    skew_matrices = rotation_matrices - rotation_matrices.transpose(-2, -1)
+    skew_vectors = skew_matrix_to_vector(skew_matrices)
+    # sin is always greater than 0
+    angles_sin = torch.norm(skew_vectors, dim=-1) / 2.0
+    # Compute the cosine of the angle using the relation cos theta = 1/2 * (Tr[R] - 1)
+    angles_cos = (torch.einsum("...ii", rotation_matrices) - 1.0) / 2.0
+
+    # Compute angles using the more stable atan2
+    angles = torch.atan2(angles_sin, angles_cos)
+
+    return angles, angles_sin, angles_cos
+
+
+
+def multidim_trace(mat: torch.Tensor) -> torch.Tensor:
+    """Take the trace of a matrix with leading dimensions."""
+    return torch.einsum("...ii->...", mat)
+
+
+def V_exp(skew_matrices: torch.Tensor, tol=1e-7) -> torch.Tensor:
+
+    rotation_vectors = skew_matrix_to_vector(skew_matrices)
+    angles = torch.norm(rotation_vectors, dim=-1)
+
+    # Set up identity matrix and broadcast.
+    id3 = _broadcast_identity(skew_matrices)
+
+    # Broadcast angles and pre-compute square.
+    angles = angles[..., None, None]
+    angles_sq = angles.square()
+    angles_3 = angles ** 3
+
+    # Get standard terms.
+    # sin_coeff = torch.sin(angles) / angles
+    cos_coeff = (1.0 - torch.cos(angles)) / angles_sq
+    C = (angles - torch.sin(angles)) / angles_3
+    # Use second order Taylor expansion for values close to zero.
+    # sin_coeff_small = 1.0 - angles_sq / 6.0
+    cos_coeff_small = 0.5 - angles_sq / 24.0
+    C_small = 1/6 - angles_sq / 120.
+
+    mask_zero = torch.abs(angles) < tol
+    # sin_coeff = torch.where(mask_zero, sin_coeff_small, sin_coeff)
+    cos_coeff = torch.where(mask_zero, cos_coeff_small, cos_coeff)
+    C_coeff   = torch.where(mask_zero, C_small, C)
+
+    # Compute matrix exponential using Rodrigues' formula.
+    # exp_skew = id3 + sin_coeff * skew_matrices + cos_coeff * (skew_matrices @ skew_matrices)
+    V =        id3 + cos_coeff * skew_matrices + C_coeff * (skew_matrices @ skew_matrices)
+    return V
+
+
+
+
+
+
+def se3_to_SE3(skew_matrices: torch.Tensor| None, u: torch.Tensor | None, rotation_vectors: torch.Tensor| None = None, tol=1e-7) -> (torch.Tensor, torch.Tensor | None):
+    r"""
+    Compute the matrix exponential of a rotation vector in skew matrix representation. Maps the
+    rotation from the lie group to the rotation matrix representation. Uses the following form of
+    Rodrigues' formula instead of `torch.linalg.matrix_exp` for better computational performance
+    (in this case the skew matrix already contains the angle factor):
+
+    .. math ::
+
+        \exp(\mathbf{K}) = \mathbf{I} + \frac{\sin(\theta)}{\theta} \mathbf{K} + \frac{1-\cos(\theta)}{\theta^2} \mathbf{K}^2
+
+    This form has the advantage, that Taylor expansions can be used for small angles (instead of
+    having to compute the unit length axis by dividing the rotation vector by small angles):
+
+    .. math ::
+
+        \frac{\sin(\theta)}{\theta} \approx 1 - \frac{\theta^2}{6}
+        \frac{1-\cos(\theta)}{\theta^2} \approx \frac{1}{2} - \frac{\theta^2}{24}
+
+    Args:
+        skew_matrices: Batch of rotation axes in skew matrix (lie so(3)) basis. (B 3 3)
+        u: (B, 3)
+    Returns:
+        torch.Tensor: Batch of corresponding rotation matrices.
+    """
+
+    if skew_matrices is None and rotation_vectors is None:
+        raise ValueError('At least one of skew_matrices and rotation_vectors is needed!')
+    elif skew_matrices is not None and rotation_vectors is not None:
+        raise ValueError('Both of skew_matrices and rotation_vec are given. Remove one!')
+
+    if skew_matrices is not None:
+        rotation_vectors = skew_matrix_to_vector(skew_matrices)
+    else:
+        skew_matrices = vector_to_skew_matrix(rotation_vectors)
+
+    assert skew_matrices.shape[0] == u.shape[0], 'Batch dims are not consistent'
+
+    angles = torch.norm(rotation_vectors, dim=-1)
+
+    # Set up identity matrix and broadcast.
+    id3 = _broadcast_identity(skew_matrices)
+
+    # Broadcast angles and pre-compute square.
+    angles = angles[..., None, None]
+    angles_sq = angles.square()
+    angles_3 = angles ** 3
+
+    # Get standard terms.
+    sin_coeff = torch.sin(angles) / angles
+    cos_coeff = (1.0 - torch.cos(angles)) / angles_sq
+    C = (angles - torch.sin(angles)) / angles_3
+    # Use second order Taylor expansion for values close to zero.
+    sin_coeff_small = 1.0 - angles_sq / 6.0
+    cos_coeff_small = 0.5 - angles_sq / 24.0
+    C_small = 1/6 - angles_sq / 120.
+
+    mask_zero = torch.abs(angles) < tol
+    sin_coeff = torch.where(mask_zero, sin_coeff_small, sin_coeff)
+    cos_coeff = torch.where(mask_zero, cos_coeff_small, cos_coeff)
+    C_coeff   = torch.where(mask_zero, C_small, C)
+
+    # Compute matrix exponential using Rodrigues' formula.
+    exp_skew = id3 + sin_coeff * skew_matrices + cos_coeff * (skew_matrices @ skew_matrices)
+    V =        id3 + cos_coeff * skew_matrices + C_coeff * (skew_matrices @ skew_matrices)
+
+    if u is None:
+        return exp_skew, None
+
+    exp_u = torch.einsum("...ij,...j->...i", V, u)
+
+    return exp_skew, exp_u
+
+def rotmat_to_rotvec(rotation_matrices: torch.Tensor) -> torch.Tensor:
+    """
+    Convert a batch of rotation matrices to rotation vectors (logarithmic map from SO(3) to so(3)).
+    The standard logarithmic map can be derived from Rodrigues' formula via Taylor approximation
+    (in this case operating on the vector coefficients of the skew so(3) basis).
+
+    ..math ::
+
+        \left[\log(\mathbf{R})\right]^\lor = \frac{\theta}{2\sin(\theta)} \left[\mathbf{R} - \mathbf{R}^\top\right]^\lor
+
+    This formula has problems at 1) angles theta close or equal to zero and 2) at angles close and
+    equal to pi.
+
+    To improve numerical stability for case 1), the angle term at small or zero angles is
+    approximated by its truncated Taylor expansion:
+
+    .. math ::
+
+        \left[\log(\mathbf{R})\right]^\lor \approx \frac{1}{2} (1 + \frac{\theta^2}{6}) \left[\mathbf{R} - \mathbf{R}^\top\right]^\lor
+
+    For angles close or equal to pi (case 2), the outer product relation can be used to obtain the
+    squared rotation vector:
+
+    .. math :: \omega \otimes \omega = \frac{1}{2}(\mathbf{I} + R)
+
+    Taking the root of the diagonal elements recovers the normalized rotation vector up to the signs
+    of the component. The latter can be obtained from the off-diagonal elements.
+
+    Adapted from https://github.com/jasonkyuyim/se3_diffusion/blob/2cba9e09fdc58112126a0441493b42022c62bbea/data/so3_utils.py
+    which was adapted from https://github.com/geomstats/geomstats/blob/master/geomstats/geometry/special_orthogonal.py
+    with heavy help from https://cvg.cit.tum.de/_media/members/demmeln/nurlanov2021so3log.pdf
+
+    Args:
+        rotation_matrices (torch.Tensor): Input batch of rotation matrices.
+
+    Returns:
+        torch.Tensor: Batch of rotation vectors.
+    """
+    # Get angles and sin/cos from rotation matrix.
+    angles, angles_sin, _ = angle_from_rotmat(rotation_matrices)
+    # Compute skew matrix representation and extract so(3) vector components.
+    vector = skew_matrix_to_vector(rotation_matrices - rotation_matrices.transpose(-2, -1))
+
+    # Three main cases for angle theta, which are captured
+    # 1) Angle is 0 or close to zero -> use Taylor series for small values / return 0 vector.
+    mask_zero = torch.isclose(angles, torch.zeros_like(angles)).to(angles.dtype)
+    # 2) Angle is close to pi -> use outer product relation.
+    mask_pi = torch.isclose(angles, torch.full_like(angles, np.pi), atol=1e-2).to(angles.dtype)
+    # 3) Angle is unproblematic -> use the standard formula.
+    mask_else = (1 - mask_zero) * (1 - mask_pi)
+
+    # Compute case dependent pre-factor (1/2 for angle close to 0, angle otherwise).
+    numerator = mask_zero / 2.0 + angles * mask_else
+    # The Taylor expansion used here is actually the inverse of the Taylor expansion of the inverted
+    # fraction sin(x) / x which gives better accuracy over a wider range (hence the minus and
+    # position in denominator).
+    denominator = (
+        (1.0 - angles**2 / 6.0) * mask_zero  # Taylor expansion for small angles.
+        + 2.0 * angles_sin * mask_else  # Standard formula.
+        + mask_pi  # Avoid zero division at angle == pi.
+    )
+    prefactor = numerator / denominator
+    vector = vector * prefactor[..., None]
+
+    # For angles close to pi, derive vectors from their outer product (ww' = 1 + R).
+    id3 = _broadcast_identity(rotation_matrices)
+    skew_outer = (id3 + rotation_matrices) / 2.0
+    # Ensure diagonal is >= 0 for square root (uses identity for masking).
+    skew_outer = skew_outer + (torch.relu(skew_outer) - skew_outer) * id3
+
+    # Get basic rotation vector as sqrt of diagonal (is unit vector).
+    vector_pi = torch.sqrt(torch.diagonal(skew_outer, dim1=-2, dim2=-1))
+
+    # Compute the signs of vector elements (up to a global phase).
+    # Fist select indices for outer product slices with the largest norm.
+    signs_line_idx = torch.argmax(torch.norm(skew_outer, dim=-1), dim=-1).long()
+    # Select rows of outer product and determine signs.
+    signs_line = torch.take_along_dim(skew_outer, dim=-2, indices=signs_line_idx[..., None, None])
+    signs_line = signs_line.squeeze(-2)
+    signs = torch.sign(signs_line)
+
+    # Apply signs and rotation vector.
+    vector_pi = vector_pi * angles[..., None] * signs
+
+    # Fill entries for angle == pi in rotation vector (basic vector has zero entries at this point).
+    vector = vector + vector_pi * mask_pi[..., None]
+
+    return vector
+
+
+def SE3_to_se3(rotation_matrices: torch.Tensor, u: torch.Tensor | None, tol=1e-7) -> (torch.Tensor, torch.Tensor | None):
+    """
+    Convert a batch of rotation matrices to rotation vectors (logarithmic map from SO(3) to so(3)).
+    The standard logarithmic map can be derived from Rodrigues' formula via Taylor approximation
+    (in this case operating on the vector coefficients of the skew so(3) basis).
+
+    ..math ::
+
+        \left[\log(\mathbf{R})\right]^\lor = \frac{\theta}{2\sin(\theta)} \left[\mathbf{R} - \mathbf{R}^\top\right]^\lor
+
+    This formula has problems at 1) angles theta close or equal to zero and 2) at angles close and
+    equal to pi.
+
+    To improve numerical stability for case 1), the angle term at small or zero angles is
+    approximated by its truncated Taylor expansion:
+
+    .. math ::
+
+        \left[\log(\mathbf{R})\right]^\lor \approx \frac{1}{2} (1 + \frac{\theta^2}{6}) \left[\mathbf{R} - \mathbf{R}^\top\right]^\lor
+
+    For angles close or equal to pi (case 2), the outer product relation can be used to obtain the
+    squared rotation vector:
+
+    .. math :: \omega \otimes \omega = \frac{1}{2}(\mathbf{I} + R)
+
+    Taking the root of the diagonal elements recovers the normalized rotation vector up to the signs
+    of the component. The latter can be obtained from the off-diagonal elements.
+
+    Adapted from https://github.com/jasonkyuyim/se3_diffusion/blob/2cba9e09fdc58112126a0441493b42022c62bbea/data/so3_utils.py
+    which was adapted from https://github.com/geomstats/geomstats/blob/master/geomstats/geometry/special_orthogonal.py
+    with heavy help from https://cvg.cit.tum.de/_media/members/demmeln/nurlanov2021so3log.pdf
+
+    Args:
+        rotation_matrices (torch.Tensor): Input batch of rotation matrices.
+
+    Returns:
+        torch.Tensor: Batch of rotation vectors.
+    """
+    # Get angles and sin/cos from rotation matrix.
+    angles, angles_sin, _ = angle_from_rotmat(rotation_matrices)
+    # R-R^T
+    sign_matrix = rotation_matrices - rotation_matrices.mT  # B 3 3 
+    sign_vector = skew_matrix_to_vector(sign_matrix)
+
+    # Three main cases for angle theta, which are captured
+    # 1) Angle is 0 or close to zero -> use Taylor series for small values / return 0 vector.
+    mask_zero = torch.isclose(angles, torch.zeros_like(angles), atol=tol).to(angles.dtype)
+    # 2) Angle is close to pi -> use outer product relation.
+    mask_pi = torch.isclose(angles, torch.full_like(angles, np.pi), atol=1e-2).to(angles.dtype)
+    # 3) Angle is unproblematic -> use the standard formula.
+    mask_else = (1 - mask_zero) * (1 - mask_pi)
+
+    # Compute case dependent pre-factor (1/2 for angle close to 0, angle otherwise).
+    numerator = mask_zero / 2.0 + angles * mask_else
+    # The Taylor expansion used here is actually the inverse of the Taylor expansion of the inverted
+    # fraction sin(x) / x which gives better accuracy over a wider range (hence the minus and
+    # position in denominator).
+    denominator = (
+        (1.0 - angles**2 / 6.0) * mask_zero  # Taylor expansion for small angles.
+        + 2.0 * angles_sin * mask_else  # Standard formula.
+        + mask_pi  # Avoid zero division at angle == pi.
+    )
+    prefactor = numerator / denominator
+    # vector =
+
+    # For angles close to pi, derive vectors from their outer product (ww' = 1 + R).
+    id3 = _broadcast_identity(rotation_matrices)
+
+    # correlation matrix S
+    S = rotation_matrices + rotation_matrices.mT + (1 - multidim_trace(rotation_matrices)).unsqueeze(-1).unsqueeze(-1) * id3
+    # only use this term for mask_pi. avoid overflow for non-mask_pi
+    trace_mask_pi = mask_pi * (3 - multidim_trace(rotation_matrices)) + (1 - mask_pi) * 1
+    # trace_mask_pi = (1 - mask_zero) * (3 - multidim_trace(rotation_matrices)) + mask_zero * 1
+    S = S / trace_mask_pi.unsqueeze(-1).unsqueeze(-1)
+    
+    # unsigned normalized vector
+    eta = torch.sqrt(torch.clamp(torch.diagonal(S, dim1=-2, dim2=-1), 1e-7)) # B 3
+    # eta = torch.sqrt(torch.diagonal(S, dim1=-2, dim2=-1)) # B 3
+
+    # determine the sign of the largest element
+    sign_select = torch.argmax(torch.abs(sign_vector), dim=-1) # B
+    sign_largest = torch.sign(torch.gather(sign_vector, 1, sign_select.unsqueeze(-1))) # B 1
+
+    # then determine the sign of ita according to S
+    Sign_select_index = einops.repeat(sign_select, '... -> (...) i j', i=1, j=3) # B 1 3
+    S_sign = torch.gather(torch.sign(S), 1, Sign_select_index) # B 1 3
+    sign_eta = S_sign.squeeze(-2) * sign_largest # B 3
+
+    # combine angle, sign, norm to get the rotation vector
+    vector_pi = sign_eta * eta * angles[..., None]
+
+    # finally get vector
+    vector = sign_vector * prefactor[..., None] + vector_pi * mask_pi[..., None]
+    skew_matrices = vector_to_skew_matrix(vector)
+
+    if u is None:
+        return skew_matrices, None
+    ########### compute V_ inverse
+    V = V_exp(skew_matrices, tol=tol) # B 3 3
+    inv_V_u = torch.linalg.solve(V, u)
+
+    return skew_matrices, inv_V_u
+
+
+
+def rt2g(r:torch.Tensor, t:torch.Tensor):
+    # pdb.set_trace()
+    rt = torch.cat([r, t.unsqueeze(-1)], -1)
+    zero_one = torch.cat([torch.zeros((*r.shape[:-2], 1, 3), device=r.device, dtype=r.dtype),
+                          torch.ones((*r.shape[:-2], 1, 1), device=r.device, dtype=r.dtype)], -1)
+    g = torch.cat([rt, zero_one], -2)
+    return g
+
+def wu2g(w, u):
+    wu = torch.cat([w, u.unsqueeze(-1)], -1)
+    zero = torch.zeros((*w.shape[:-2], 1, 4), device=w.device, dtype=w.dtype)
+    g = torch.cat([wu, zero], -2)
+    return g
+
+
+def log_SE3(A, tol=1e-7):
+    r  = A[..., :3, :3]
+    t = A[..., :3, 3]
+    w, u = SE3_to_se3(r, t, tol=tol)
+    se3 = wu2g(w, u)
+    return se3
+
+def exp_se3(A, tol=1e-7):
+    if A.shape[-1] == A.shape[-2]  == 4:
+        w  = A[..., :3, :3]
+        u = A[..., :3, 3]
+        r, t = se3_to_SE3(w, u, tol=tol)
+    elif A.shape[-1] == 6:
+        w_vec = A[..., :3]
+        u = A[..., 3:]
+        r, t = se3_to_SE3(None, u, rotation_vectors=w_vec, tol=tol)
+    else:
+        raise ValueError('A.shape must be (B, 4, 4) for the matrix form or (B, 6) for the vector form.')
+    SE3 = rt2g(r, t)
+    return SE3
+
+
+def random_SE3(piece_num, sigma=1., zero_mean=False, seed=None, only_translation=0, only_rotation=0, rot_deg=180.):
+    rng = np.random.RandomState(seed)
+
+    if only_translation == 1:
+        r_0 = einops.repeat(torch.eye(3, dtype=torch.float32).unsqueeze(0), ' a b c -> (a r) b c', r=piece_num)
+    elif only_translation == 0:
+        r_0 = torch.tensor(random_sample_rotation(batch=piece_num, rotation_deg=rot_deg, rng=rng)).type(torch.float32)
+    else:
+        raise NotImplementedError
+
+    if only_rotation == 1:
+        t_0 = torch.zeros((piece_num, 3))
+    else:
+        t_0 = torch.randn(piece_num, 3) * sigma
+
+    if zero_mean:
+        t_0 = t_0 - t_0.mean(0, True)
+
+    g_0 = rt2g(r_0, t_0)
+    return g_0
+
+
+def inv_SE3(g: torch.Tensor):
+    inv_r = g[:, :3, :3].mT
+    inv_t = -inv_r @ g[:, :3, 3:]
+    inv_g = rt2g(inv_r, inv_t.squeeze(-1))
+    return inv_g
+
+
+def direction(g0, g1, path_type=1):
+    # geodesic in SE3
+    if path_type == 1:
+        inv_g0 = inv_SE3(g0)
+        d = log_SE3(g1 @ inv_g0)
+        return d
+    # geodesic in SO3 and straight line in R3
+    elif path_type == 2:
+        r0 = g0[..., :3, :3]
+        t0 = g0[..., :3, 3]
+        inv_r0 = r0.mT
+
+        r1 = g1[..., :3, :3]
+        t1 = g1[..., :3, 3]
+
+        w, _ = SE3_to_se3(r1 @ inv_r0, None)
+        u = t1 - t0
+        se3 = wu2g(w, u)
+        return se3
+
+    raise ValueError(f'Unknown path type {path_type}')
+
+
+def corrupt(g0, g1, t, path_type=1):
+    d_01 = direction(g0, g1, path_type=path_type)
+    gt = exp_se3(t.unsqueeze(-1).unsqueeze(-1) * d_01) @ g0
+
+    w_vec = skew_matrix_to_vector(d_01[:, :3, :3])
+    u_vec = d_01[:, :3, 3]
+
+    return gt, w_vec, u_vec
+
+
+def SE3_action(g, X):
+    '''
+    The action of g on X
+    :param g: a rigid transformation g
+    :param X: a PC
+    :return:
+    '''
+    g_full = torch.index_select(g, 0, X.piece_index)
+    gx_cor = g_full[:, :3, :3] @ X.x_cor.unsqueeze(-1) + g_full[:, :3, 3:]
+    gx_cor = gx_cor.squeeze(-1)
+    Y = X.clone()
+    Y.x_cor = gx_cor
+
+    W = so3.RotationToWignerDMatrix(g_full[:, :3, :3], X.x_f.shape[2])
+    Y.x_f = so3.rotate(W, X.x_f)
+
+    return Y
+
+
+
+
+
+# if __name__ == '__main__':
+    # import pdb
+
+    # import torch
+    # import Utils.so3_utils as so3_utils
+    # from scipy.linalg import logm, expm
+    # import einops
+
+    # import numpy as np
+
+    # b = 1
+    # SE3 = random_SE3(b)
+    # inv_g = inv_SE3(SE3)
+    # print((inv_g @ SE3 - torch.eye(4).unsqueeze(0)).norm().numpy())
+    #
+    # re_se3 = log_SE3(SE3)
+    # re_se3_np = np.real(logm(SE3.numpy()[0]))
+    #
+    # print(np.linalg.norm(re_se3_np - re_se3[0].cpu().numpy()))
+    #
+    # SE3_re = exp_se3(re_se3)
+    # SE3_np_re = expm(re_se3_np)
+    #
+    # print(np.linalg.norm(SE3_re.cpu().numpy() - SE3.cpu().numpy()))
+    # print(np.linalg.norm(SE3_np_re - SE3[0].cpu().numpy()))
+
+    ### test 2
+    # v = np.random.randn(1, 3)
+    # r_0 = Rotation.random(num=1).as_matrix()[0]
+    # r_v = (r_0 @ v.T).T
+    # r0_r_r0i = Rotation.from_rotvec(r_v).as_matrix()
+    # r0_r_r0i_compute = r_0 @ Rotation.from_rotvec(v[0]).as_matrix() @ r_0.T
+
+    # pdb.set_trace()
+    ### test 3
+    # v = torch.randn((1, 3))
+    # w = vector_to_skew_matrix(v)
+    #
+    # r_0 = torch.tensor(Rotation.random(num=1).as_matrix()[0]).type(torch.float32)
+    # r_v = (r_0 @ v.T).T
+    #
+    # r_w = vector_to_skew_matrix(r_v)
+    # rw_compute = r_0 @ w @ r_0.T
+    #
+    # (r_w - rw_compute).norm()
+    #
+    # pdb.set_trace()
+    ######
+    # b = 5
+    # SE3 = random_SE3(b, zero_mean=False)
+    # # pdb.set_trace()
+    # t = SE3[:, :3, 3]
+    # print(t.mean(0))
+    ######
+
+    # b = 2
+    # g1 = random_SE3(b, zero_mean=True)
+    # g0 = random_SE3(b, zero_mean=True)
+    #
+    # p1 = direction(g0, g1, path_type=1)
+    # p2 = direction(g0, g1, path_type=2)
+    #
+    #
+    # r1 = p1[:, :3, :3]
+    # t1 = p1[:, :3, 3]
+    #
+    # r2 = p2[:, :3, :3]
+    # t2 = p2[:, :3, 3]
+    #
+    # print((r1 - r2).norm())
+    #
+    # print(t1)
+    # print(t2)
+    #
+    # pdb.set_trace()

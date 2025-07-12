@@ -1,0 +1,93 @@
+Experiment: overfitting
+debug: 0
+
+#### Loss and path
+distance_weight: 1.
+# logitnorm,  uniform, uniform_discrete, logitnorm_discrete, poly_discrete, exp_discrete
+t_type: 'logitnorm'
+t_m: 0.0
+t_s: 1.0
+training_step: 1000
+coe_f_poly: 2.0
+coe_f_exp: -5.0
+# Evaluation
+test_step: 10
+# linear, poly, exp, cos
+t_test_type: 'linear'
+sample_order: 1
+sample_alpha: 1
+
+
+#### For test
+only_test: 0
+# for continue training or testing
+run_id: None
+# keep as 1
+repeat: 1
+save_pc: 1
+# set to greater than 1 to run multiple times to compute std and average
+repeat_test: 1
+test_feq: 1
+# 1, constant speed, 2. straight line in R3, 3. exponentially slow curve 4. deg-2 slow curve
+path_type: 1
+test_path_type: 1
+path_coe: 5.0
+# Collect all errors for analysis
+Collect_all: "False"
+# save the test results for visualization
+save: 0
+
+
+### training
+starting_epoch: 0
+lr: 0.0001
+save_model: "True"
+save_freq: 20
+epochs: 1000
+center_noise: "True"
+noise_sigma: -1.0
+# Adam or AdanW
+optim: 2
+# random or matching
+r_type: 'matching'
+
+
+### Dataset
+# Match2, kitti or BB
+data_name: bunny
+
+# used for data augmentation
+keep_ratio: 0.7
+noise_magnitude: 0.0
+
+#asymmetric: True
+return_normals: 0
+pieces_num: 2
+use_color: "False"
+class_indices: 0
+bs: 1
+frame_skip: 3
+# The threshold for the targest point cloud. Larger point cloud will be downsampled.
+num_points: 5000
+fix_piece_num: 0
+
+### Network
+emb_channel: "64,64"
+L: 2
+num_heads: 4
+fc_neurons: "32,16"
+n_scales: 4
+n_layers: 2
+pool_ratio: 0.25
+irreps_mlp_mid: 3
+knn: 5
+norm_type: '01010'
+nonlinear_type: 'silu'
+zero_init: 0
+qk_norm: "True"
+#estimate_len: 0
+ema_decay: 0.9999
+ema_step: 100
+use_amp: "True"
+ddp: 0
+use_gradient_clip: "False"

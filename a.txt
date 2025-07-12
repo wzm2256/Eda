@@ -1,0 +1,16 @@
+# training script
+torchrun --nproc-per-node=3 --standalone main.py --ddp 1 --Experiment Low_n4       --data_name Match2                     --bs 10                                                                    --noise_sigma 0.11 --return_normals 1
+torchrun --nproc-per-node=3 --standalone main.py --ddp 1 --Experiment Zero_n4      --data_name Match2  --class_indices 2  --bs 10                                                                    --noise_sigma 0.49 --return_normals 1
+torchrun --nproc-per-node=2 --standalone main.py --ddp 1 --Experiment unfix_4_92   --data_name kitti                      --bs 10                    --epochs 8008  --pieces_num 4 --fix_piece_num 0 --noise_sigma 0.47 --return_normals 1
+torchrun --nproc-per-node=3 --standalone main.py --ddp 1 --Experiment C0           --data_name BB                         --bs 20  --num_points 2500                                                 --noise_sigma 0.14 --return_normals 1
+torchrun --nproc-per-node=2 --standalone main.py --ddp 1 --Experiment unfix_3_92   --data_name kitti                      --bs 10                    --epochs 8008  --pieces_num 3 --fix_piece_num 0 --noise_sigma 0.47 --return_normals 1
+
+
+# test script
+torchrun --nproc-per-node=1 --standalone main.py --ddp 1 --Experiment Low_n4   --data_name Match2 --only_test 1  --run_id Match2L --starting_epoch -2                     --bs 3                   --return_normals 1                                  --noise_sigma 0. --test_step 50 --sample_order 41
+torchrun --nproc-per-node=1 --standalone main.py --ddp 1 --Experiment Low_n4   --data_name Match2 --only_test 1  --run_id Match2L --starting_epoch -2   --class_indices 1 --bs 30                   --return_normals 1                                  --noise_sigma 0. --test_step 50 --sample_order 41
+torchrun --nproc-per-node=1 --standalone main.py --ddp 1 --Experiment Zero_n4  --data_name Match2 --only_test 1  --run_id Match2Z --starting_epoch -2   --class_indices 2 --bs 30                   --return_normals 1                                  --noise_sigma 0. --test_step 50 --sample_order 41
+torchrun --nproc-per-node=1 --standalone main.py --ddp 1 --Experiment C0       --data_name BB     --only_test 1  --run_id BB      --starting_epoch -2                     --bs 30 --num_points 2500 --return_normals 1                                  --noise_sigma 0. --test_step 50 --sample_order 41
+torchrun --nproc-per-node=1 --standalone main.py --ddp 1 --Experiment unfix_4  --data_name kitti  --only_test 1  --run_id kitti4  --starting_epoch -2                     --bs 5                   --return_normals 1 --pieces_num 3 --fix_piece_num 1 --noise_sigma 0. --test_step 50 --sample_order 41
+torchrun --nproc-per-node=1 --standalone main.py --ddp 1 --Experiment unfix_3  --data_name kitti  --only_test 1  --run_id kitti3  --starting_epoch -2                     --bs 5                   --return_normals 1 --pieces_num 3 --fix_piece_num 1 --noise_sigma 0. --test_step 50 --sample_order 41
+
